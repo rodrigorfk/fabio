@@ -52,7 +52,12 @@ func (w *ServiceMonitor) Watch(updates chan string) {
 		passing := passingServices(checks, w.config.ServiceStatus, w.strict)
 
 		// build the config for the passing services
-		updates <- w.makeConfig(passing)
+		fabioConfig, err := w.makeConfig(passing)
+		if err == nil {
+			updates <- fabioConfig
+		} else {
+			log.Printf("[WARN] consul: Error fetching catalog, ignoring health change. %v", err)
+		}
 
 		// remember the last state and wait for the next change
 		lastIndex = meta.LastIndex
@@ -61,7 +66,7 @@ func (w *ServiceMonitor) Watch(updates chan string) {
 
 // makeConfig determines which service instances have passing health checks
 // and then finds the ones which have tags with the right prefix to build the config from.
-func (w *ServiceMonitor) makeConfig(checks []*api.HealthCheck) string {
+func (w *ServiceMonitor) makeConfig(checks []*api.HealthCheck) (string, error) {
 	// map service name to list of service passing for which the health check is ok
 	m := map[string]map[string]bool{}
 	for _, check := range checks {
@@ -81,40 +86,33 @@ func (w *ServiceMonitor) makeConfig(checks []*api.HealthCheck) string {
 		n = 1
 	}
 
-	sem := make(chan int, n)
-	cfgs := make(chan []string, len(m))
+	var fabioConfig []string
 	for name, passing := range m {
 		name, passing := name, passing
-		go func() {
-			sem <- 1
-			cfgs <- w.serviceConfig(name, passing)
-			<-sem
-		}()
-	}
-
-	var config []string
-	for i := 0; i < len(m); i++ {
-		cfg := <-cfgs
-		config = append(config, cfg...)
+		c, err := w.serviceConfig(name, passing)
+		if err != nil {
+			return "", err
+		}
+		fabioConfig = append(fabioConfig, c...)
 	}
 
 	// sort config in reverse order to sort most specific config to the top
-	sort.Sort(sort.Reverse(sort.StringSlice(config)))
+	sort.Sort(sort.Reverse(sort.StringSlice(fabioConfig)))
 
-	return strings.Join(config, "\n")
+	return strings.Join(fabioConfig, "\n"), nil
 }
 
 // serviceConfig constructs the config for all good instances of a single service.
-func (w *ServiceMonitor) serviceConfig(name string, passing map[string]bool) (config []string) {
+func (w *ServiceMonitor) serviceConfig(name string, passing map[string]bool) (config []string, err error) {
 	if name == "" || len(passing) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	q := &api.QueryOptions{RequireConsistent: w.config.RequireConsistent, AllowStale: w.config.AllowStale}
 	svcs, _, err := w.client.Catalog().Service(name, "", q)
 	if err != nil {
 		log.Printf("[WARN] consul: Error getting catalog service %s. %v", name, err)
-		return nil
+		return nil, err
 	}
 
 	env := map[string]string{
@@ -136,5 +134,5 @@ func (w *ServiceMonitor) serviceConfig(name string, passing map[string]bool) (co
 
 		config = append(config, cmds...)
 	}
-	return config
+	return config, nil
 }
